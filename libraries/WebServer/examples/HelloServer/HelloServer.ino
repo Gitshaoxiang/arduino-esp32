@@ -1,10 +1,11 @@
+#include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
+#include <NetworkClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 
-const char* ssid = "........";
-const char* password = "........";
+const char *ssid = "........";
+const char *password = "........";
 
 WebServer server(80);
 
@@ -26,7 +27,7 @@ void handleNotFound() {
   message += "\nArguments: ";
   message += server.args();
   message += "\n";
-  for (uint8_t i = 0; i < server.args(); i++) {
+  for (int i = 0; i < server.args(); i++) {
     message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
   server.send(404, "text/plain", message);
@@ -70,4 +71,5 @@ void setup(void) {
 
 void loop(void) {
   server.handleClient();
+  delay(2);  //allow the cpu to switch to other tasks
 }

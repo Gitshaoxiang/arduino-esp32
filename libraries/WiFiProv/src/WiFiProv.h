@@ -1,48 +1,82 @@
 /*
     WiFiProv.h - Base class for provisioning support
     All right reserved.
- 
+
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
     License as published by the Free Software Foundation; either
     version 2.1 of the License, or (at your option) any later version.
-  
+
     This library is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
     Lesser General Public License for more details.
-  
+
     You should have received a copy of the GNU Lesser General Public
     License along with this library; if not, write to the Free Software
     Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
+#pragma once
+
+#include "soc/soc_caps.h"
+#include "sdkconfig.h"
+#if SOC_WIFI_SUPPORTED && CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
+
 #include "WiFi.h"
-#include "wifi_provisioning/manager.h"
-#include "wifi_provisioning/scheme_ble.h"
+#include "HardwareSerial.h"
+#include "network_provisioning/manager.h"
 //Select the scheme using which you want to provision
-typedef enum 
-{
-    WIFI_PROV_SCHEME_BLE,
-    WIFI_PROV_SCHEME_SOFTAP
-}scheme_t;
+typedef enum {
+  NETWORK_PROV_SCHEME_SOFTAP,
+#if (defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)) && __has_include("esp_bt.h")
+  NETWORK_PROV_SCHEME_BLE,
+#endif
+  NETWORK_PROV_SCHEME_MAX
+} prov_scheme_t;
 
-extern void provSchemeSoftAP();
-extern void provSchemeBLE();
+typedef enum {
+  NETWORK_PROV_SCHEME_HANDLER_NONE,
+#if (defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)) && __has_include("esp_bt.h")
+  NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+  NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
+  NETWORK_PROV_SCHEME_HANDLER_FREE_BT,
+#endif
+  NETWORK_PROV_SCHEME_HANDLER_MAX
+} scheme_handler_t;
 
-//Provisioning class 
-class WiFiProvClass
-{
-    public:
+#if defined(CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0)
+#define NETWORK_PROV_SECURITY NETWORK_PROV_SECURITY_0
+#elif defined(CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1)
+#define NETWORK_PROV_SECURITY NETWORK_PROV_SECURITY_1
+#elif defined(CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2)
+#define NETWORK_PROV_SECURITY NETWORK_PROV_SECURITY_2
+#else
+#define NETWORK_PROV_SECURITY 0
+#endif
 
-    void beginProvision(void (*scheme_cb)() = provSchemeSoftAP, wifi_prov_event_handler_t scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE, wifi_prov_security_t security = WIFI_PROV_SECURITY_1, const char * pop = "abcd1234", const char * service_name = NULL, const char * service_key = NULL, uint8_t *uuid = NULL);
+//Provisioning class
+class WiFiProvClass {
+private:
+  bool provInitDone = false;
+  bool provisioned = false;
+
+public:
+  void initProvision(
+    prov_scheme_t prov_scheme = NETWORK_PROV_SCHEME_SOFTAP, scheme_handler_t scheme_handler = NETWORK_PROV_SCHEME_HANDLER_NONE, bool reset_provisioned = false
+  );
+  void beginProvision(
+    prov_scheme_t prov_scheme = NETWORK_PROV_SCHEME_SOFTAP, scheme_handler_t scheme_handler = NETWORK_PROV_SCHEME_HANDLER_NONE,
+    network_prov_security_t security = NETWORK_PROV_SECURITY, const char *pop = "abcd1234", const char *service_name = NULL, const char *service_key = NULL,
+    uint8_t *uuid = NULL, bool reset_provisioned = false
+  );
+  void endProvision();
+  bool disableAutoStop(uint32_t cleanup_delay);
+  void printQR(const char *name, const char *pop, const char *transport, Print &out = Serial);
 };
+
+#if !defined(NO_GLOBAL_INSTANCES) && !defined(NO_GLOBAL_WIFIPROV)
 extern WiFiProvClass WiFiProv;
-/*
- Event Handler for BLE
-      - WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM
-      - WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE
-      - WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT
-Event Handler for SOFTAP
-      - WIFI_PROV_EVENT_HANDLER_NONE
-*/
+#endif
+
+#endif /* SOC_WIFI_SUPPORTED */

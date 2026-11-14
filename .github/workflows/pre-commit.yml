@@ -1,0 +1,100 @@
+name: Pre-commit hooks
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+concurrency:
+  group: pre-commit-${{github.event.pull_request.number || github.ref}}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'Status: Pending Merge') ||
+      contains(github.event.pull_request.labels.*.name, 'Re-trigger Pre-commit Hooks')
+
+    name: Check if fixes are needed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          cache-dependency-path: tools/pre-commit/requirements.txt
+          cache: "pip"
+          python-version: "3.x"
+
+      - name: Get Python version hash
+        run: |
+          echo "Using $(python -VV)"
+          echo "PY_HASH=$(python -VV | sha256sum | cut -d' ' -f1)" >> $GITHUB_ENV
+
+      - name: Restore pre-commit cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: restore-cache
+        with:
+          path: |
+            ~/.cache/pre-commit
+          key: pre-commit-${{ env.PY_HASH }}-${{ hashFiles('.pre-commit-config.yaml', '.github/workflows/pre-commit.yml', 'tools/pre-commit/requirements.txt') }}
+
+      - name: Install python dependencies
+        run: python -m pip install -r tools/pre-commit/requirements.txt
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+
+      - name: Run pre-commit hooks in changed files
+        id: pre-commit
+        run: pre-commit run --color=always --show-diff-on-failure --files ${{ steps.changed-files.outputs.all_changed_files }}
+
+      - name: Save pre-commit cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.restore-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cache/pre-commit
+          key: ${{ steps.restore-cache.outputs.cache-primary-key }}
+
+      - name: Push changes using pre-commit-ci-lite
+        uses: pre-commit-ci/lite-action@062bca0919bc9d6e66755cc05074b70c77e111fc # v1.2.0
+        # Only push changes in PRs
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        with:
+          msg: "ci(pre-commit): Apply automatic fixes"
+
+      - name: Save workflow information for labeling
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        run: |
+          mkdir -p ./pr-artifacts
+          echo "${{ github.event.number }}" > ./pr-artifacts/pr_number.txt
+          echo "${{ steps.pre-commit.outcome }}" > ./pr-artifacts/pre_commit_outcome.txt
+          echo "${{ steps.pre-commit.outputs.pending_commit }}" > ./pr-artifacts/pending_commit.txt
+          echo "${{ contains(github.event.pull_request.labels.*.name, 'Re-trigger Pre-commit Hooks') }}" > ./pr-artifacts/has_retrigger_label.txt
+          # lite can push to same-repo branches and user forks with maintainer edits; not org forks or forks that disable them
+          echo "${{ github.event.pull_request.head.repo.full_name != github.repository && !github.event.pull_request.maintainer_can_modify }}" > ./pr-artifacts/cannot_push_fixes.txt
+
+      - name: Upload PR artifacts
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-artifacts
+          path: ./pr-artifacts/
+          retention-days: 1
+

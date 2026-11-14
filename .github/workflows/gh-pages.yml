@@ -3,19 +3,28 @@ name: GitHub Pages CI
 on:
   push:
     branches:
-    - master
+      - master
+      - pages
     paths:
-    - 'README.md'
-    - 'docs/**'
+      - "README.md"
+      - ".github/scripts/on-pages.sh"
+      - ".github/workflows/gh-pages.yml"
+
+permissions:
+  contents: write
+  pages: write
 
 jobs:
-
   build-pages:
     name: Build GitHub Pages
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
-    - name: Copy Files
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: bash ./.github/scripts/on-pages.sh
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Copy Files
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/on-pages.sh

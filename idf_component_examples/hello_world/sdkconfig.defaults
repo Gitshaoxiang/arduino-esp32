@@ -1,0 +1,18 @@
+#
+# Arduino ESP32
+#
+CONFIG_AUTOSTART_ARDUINO=y
+# end of Arduino ESP32
+
+#
+# FREERTOS
+#
+CONFIG_FREERTOS_HZ=1000
+# end of FREERTOS
+# end of Component config
+
+# IDF v6 requirements
+# esp-dsp and other things fail to build with picolibc
+CONFIG_LIBC_NEWLIB=y
+# required for tinyusb and some IDF components to build properly
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y

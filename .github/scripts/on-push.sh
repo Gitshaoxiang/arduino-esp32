@@ -2,70 +2,114 @@
 
 set -e
 
-if [ ! -z "$TRAVIS_TAG" ]; then
-	echo "Skipping Test: Tagged build"
-	exit 0
-fi
+# Source centralized SoC configuration
+SCRIPTS_DIR="./.github/scripts"
+source "${SCRIPTS_DIR}/socs_config.sh"
 
-if [ ! -z "$GITHUB_WORKSPACE" ]; then
-	export TRAVIS_BUILD_DIR="$GITHUB_WORKSPACE"
-	export TRAVIS_REPO_SLUG="$GITHUB_REPOSITORY"
-elif [ ! -z "$TRAVIS_BUILD_DIR" ]; then
-	export GITHUB_WORKSPACE="$TRAVIS_BUILD_DIR"
-	export GITHUB_REPOSITORY="$TRAVIS_REPO_SLUG"
-else
-	export GITHUB_WORKSPACE="$PWD"
-	export GITHUB_REPOSITORY="espressif/arduino-esp32"
+export ARDUINO_BUILD_DIR="$HOME/.arduino/build.tmp"
+
+function build {
+    local target=$1
+    local chunk_index=$2
+    local chunks_cnt=$3
+    local build_log=$4
+    local log_level=${5:-none}
+    local sketches_file=$6
+    shift 6
+    local sketches=("$@")
+
+    local BUILD_SKETCH="${SCRIPTS_DIR}/sketch_utils.sh build"
+    local BUILD_SKETCHES="${SCRIPTS_DIR}/sketch_utils.sh chunk_build"
+
+    local args=("-au" "$ARDUINO_USR_PATH" "-t" "$target")
+
+    if [ "$OS_IS_LINUX" == "1" ]; then
+        # Membership is pre-assigned (chunk_N.txt). -i names cli_compile_N.json;
+        # chunk_build does not re-slice when -f is set.
+        args+=("-p" "$ARDUINO_ESP32_PATH/libraries" "-i" "$chunk_index" "-m" "1" "-d" "$log_level")
+        if [ -n "$sketches_file" ]; then
+            args+=("-f" "$sketches_file")
+        fi
+        if [ "$build_log" -eq 1 ]; then
+            args+=("-l" "$build_log")
+        fi
+        ${BUILD_SKETCHES} "${args[@]}"
+    else
+        for sketch in "${sketches[@]}"; do
+            local sargs=("${args[@]}")
+            local ctags_version
+            local preprocessor_version
+            sargs+=("-s" "$(dirname "$sketch")")
+            if [ "$OS_IS_WINDOWS" == "1" ] && [ -d "$ARDUINO_IDE_PATH/tools-builder" ]; then
+                ctags_version=$(ls "$ARDUINO_IDE_PATH/tools-builder/ctags/")
+                preprocessor_version=$(ls "$ARDUINO_IDE_PATH/tools-builder/arduino-preprocessor/")
+                sargs+=(
+                    "-prefs=runtime.tools.ctags.path=$ARDUINO_IDE_PATH/tools-builder/ctags/$ctags_version"
+                    "-prefs=runtime.tools.arduino-preprocessor.path=$ARDUINO_IDE_PATH/tools-builder/arduino-preprocessor/$preprocessor_version"
+                )
+            fi
+            ${BUILD_SKETCH} "${sargs[@]}"
+        done
+    fi
+}
+
+if [ -z "$GITHUB_REPOSITORY" ]; then
+    export GITHUB_REPOSITORY="espressif/arduino-esp32"
 fi
 
 CHUNK_INDEX=$1
 CHUNKS_CNT=$2
-BUILD_PIO=0
+BUILD_LOG=$3
+LOG_LEVEL=$4
+SKETCHES_FILE=$5
 if [ "$#" -lt 2 ] || [ "$CHUNKS_CNT" -le 0 ]; then
-	CHUNK_INDEX=0
-	CHUNKS_CNT=1
-elif [ "$CHUNK_INDEX" -gt "$CHUNKS_CNT" ]; then
-	CHUNK_INDEX=$CHUNKS_CNT
-elif [ "$CHUNK_INDEX" -eq "$CHUNKS_CNT" ]; then
-	BUILD_PIO=1
+    CHUNK_INDEX=0
+    CHUNKS_CNT=1
+elif [ "$CHUNK_INDEX" -gt "$CHUNKS_CNT" ] &&  [ "$CHUNKS_CNT" -ge 2 ]; then
+    CHUNK_INDEX=$CHUNKS_CNT
 fi
 
-echo "Updating submodules ..."
-git -C "$GITHUB_WORKSPACE" submodule update --init --recursive > /dev/null 2>&1
+if [ -z "$BUILD_LOG" ] || [ "$BUILD_LOG" -le 0 ]; then
+    BUILD_LOG=0
+fi
 
-if [ "$BUILD_PIO" -eq 0 ]; then
-	# ArduinoIDE Test
-	FQBN="espressif:esp32:esp32:PSRAM=enabled,PartitionScheme=huge_app"
-	source ./.github/scripts/install-arduino-ide.sh
-	source ./.github/scripts/install-arduino-core-esp32.sh
-	if [ "$OS_IS_WINDOWS" == "1" ]; then
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/WiFiClientSecure/examples/WiFiClientSecure/WiFiClientSecure.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/BLE/examples/BLE_server/BLE_server.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/AzureIoT/examples/GetStarted/GetStarted.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino"
-	elif [ "$OS_IS_MACOS" == "1" ]; then
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/WiFi/examples/WiFiClient/WiFiClient.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/WiFiClientSecure/examples/WiFiClientSecure/WiFiClientSecure.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/BluetoothSerial/examples/SerialToSerialBT/SerialToSerialBT.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/BLE/examples/BLE_server/BLE_server.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/AzureIoT/examples/GetStarted/GetStarted.ino" && \
-		build_sketch "$FQBN" "$ARDUINO_ESP32_PATH/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino"
-	else
-		# CMake Test
-		if [ "$CHUNK_INDEX" -eq 0 ]; then
-			bash "$ARDUINO_ESP32_PATH/.github/scripts/check-cmakelists.sh"
-		fi
-		build_sketches "$FQBN" "$ARDUINO_ESP32_PATH/libraries" "$CHUNK_INDEX" "$CHUNKS_CNT"
-	fi
-else
-	# PlatformIO Test
-	source ./.github/scripts/install-platformio-esp32.sh
-	BOARD="esp32dev"
-	build_pio_sketch "$BOARD" "$PLATFORMIO_ESP32_PATH/libraries/WiFi/examples/WiFiClient/WiFiClient.ino" && \
-	build_pio_sketch "$BOARD" "$PLATFORMIO_ESP32_PATH/libraries/WiFiClientSecure/examples/WiFiClientSecure/WiFiClientSecure.ino" && \
-	build_pio_sketch "$BOARD" "$PLATFORMIO_ESP32_PATH/libraries/BluetoothSerial/examples/SerialToSerialBT/SerialToSerialBT.ino" && \
-	build_pio_sketch "$BOARD" "$PLATFORMIO_ESP32_PATH/libraries/BLE/examples/BLE_server/BLE_server.ino" && \
-	build_pio_sketch "$BOARD" "$PLATFORMIO_ESP32_PATH/libraries/AzureIoT/examples/GetStarted/GetStarted.ino" && \
-	build_pio_sketch "$BOARD" "$PLATFORMIO_ESP32_PATH/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino"
-	#build_pio_sketches esp32dev "$PLATFORMIO_ESP32_PATH/libraries"
+#echo "Updating submodules ..."
+#git -C "$GITHUB_WORKSPACE" submodule update --init --recursive > /dev/null 2>&1
+
+source "${SCRIPTS_DIR}/env.sh"
+source "${SCRIPTS_DIR}/install-arduino-core-esp32.sh"
+
+SKETCHES_ESP32=(
+    "$ARDUINO_ESP32_PATH/libraries/NetworkClientSecure/examples/WiFiClientSecure/WiFiClientSecure.ino"
+    "$ARDUINO_ESP32_PATH/libraries/BLE/examples/Server/Server.ino"
+    "$ARDUINO_ESP32_PATH/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino"
+    "$ARDUINO_ESP32_PATH/libraries/Insights/examples/MinimalDiagnostics/MinimalDiagnostics.ino"
+)
+#create sizes_file
+sizes_file="$GITHUB_WORKSPACE/cli_compile_$CHUNK_INDEX.json"
+
+if [ "$OS_IS_LINUX" == "1" ]; then
+    export SKETCH_TIMES_FILE="${GITHUB_WORKSPACE:-.}/sketch_times_${CHUNK_INDEX}.jsonl"
+    : > "$SKETCH_TIMES_FILE"
+    if [ -n "$SKETCHES_FILE" ] && [ ! -f "$SKETCHES_FILE" ]; then
+        echo "No sketches assigned to $SKETCHES_FILE"
+        : > "$SKETCHES_FILE"
+    fi
+fi
+
+if [ "$BUILD_LOG" -eq 1 ]; then
+    #create sizes_file and echo start of JSON array with "boards" key
+    echo "{\"boards\": [" > "$sizes_file"
+fi
+
+#build sketches for different targets (using centralized config)
+for target in "${CORE_SOCS[@]}"; do
+    build "$target" "$CHUNK_INDEX" "$CHUNKS_CNT" "$BUILD_LOG" "$LOG_LEVEL" "$SKETCHES_FILE" "${SKETCHES_ESP32[@]}"
+done
+
+if [ "$BUILD_LOG" -eq 1 ]; then
+    #remove last comma from the last JSON object
+    sed -i '$ s/,$//' "$sizes_file"
+    #echo end of JSON array
+    echo "]}" >> "$sizes_file"
 fi

@@ -1,0 +1,947 @@
+#!/bin/bash
+
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPTS_DIR}/env.sh"
+
+function check_requirements { # check_requirements <sketchdir> <sdkconfig_path>
+    local sketchdir=$1
+    local sdkconfig_path=$2
+    local has_requirements=1
+    local requirements
+    local requirements_or
+
+    if [ ! -f "$sdkconfig_path" ] || [ ! -f "$sketchdir/ci.yml" ]; then
+        echo "WARNING: sdkconfig or ci.yml not found. Assuming requirements are met." 1>&2
+        # Return 1 on error to force the sketch to be built and fail. This way the
+        # CI will fail and the user will know that the sketch has a problem.
+    else
+        # Check if the sketch requires any configuration options (AND)
+        requirements=$(yq eval '.requires[]' "$sketchdir/ci.yml" 2>/dev/null)
+        if [[ "$requirements" != "null" && "$requirements" != "" ]]; then
+            while IFS= read -r requirement; do
+                # Trim whitespace and newlines (use sed instead of xargs for compatibility)
+                requirement=$(echo "$requirement" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[\r\n]//g')
+                # Skip empty lines
+                [[ -z "$requirement" ]] && continue
+                found_line=$(grep -E "^$requirement" "$sdkconfig_path")
+                if [[ "$found_line" == "" ]]; then
+                    # C5 publishes one Wi-Fi sdkconfig. Matter-over-Thread is
+                    # Tools → Matter Network → Thread (overlay + .thread.a).
+                    if [[ "$requirement" == "CONFIG_ENABLE_MATTER_OVER_THREAD=y" && "$sdkconfig_path" == *"/esp32c5/"* ]]; then
+                        continue
+                    fi
+                    has_requirements=0
+                fi
+            done <<< "$requirements"
+        fi
+
+        # Check if the sketch requires any configuration options (OR)
+        requirements_or=$(yq eval '.requires_any[]' "$sketchdir/ci.yml" 2>/dev/null)
+        if [[ "$requirements_or" != "null" && "$requirements_or" != "" ]]; then
+            local found=false
+            while IFS= read -r requirement; do
+                # Trim whitespace and newlines (use sed instead of xargs for compatibility)
+                requirement=$(echo "$requirement" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[\r\n]//g')
+                # Skip empty lines
+                [[ -z "$requirement" ]] && continue
+                found_line=$(grep -E "^$requirement" "$sdkconfig_path")
+                if [[ "$found_line" != "" ]]; then
+                    found=true
+                    break
+                fi
+            done <<< "$requirements_or"
+            if [[ "$found" == "false" ]]; then
+                has_requirements=0
+            fi
+        fi
+    fi
+
+    echo "$has_requirements"
+}
+
+# Join FQBN menu options, dropping empty entries and keeping only the last value
+# given for each menu key. Callers list options lowest priority first, so a test
+# can override a per-target default instead of emitting the same key twice, which
+# arduino-cli does not resolve predictably. Each key keeps the position of its
+# first appearance, so the resulting FQBN stays stable.
+function _normalize_fqbn_opts {
+    echo "$1" | tr ',' '\n' | awk '
+        {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if ($0 == "") {
+                next
+            }
+            eq = index($0, "=")
+            key = (eq ? substr($0, 1, eq - 1) : $0)
+            if (!(key in value)) {
+                order[++count] = key
+            }
+            value[key] = $0
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                printf "%s%s", (i > 1 ? "," : ""), value[order[i]]
+            }
+            printf "\n"
+        }
+    '
+}
+
+# Force ESP32-P4 Serial mapping for the environment. Applied last so it wins
+# over target defaults, fqbn_append, full FQBNs from ci.yml, and -fqbn.
+# CI hardware runners talk to UART0, so CDC on boot must be Disabled
+# (CDCOnBoot=default). Local and Wokwi use USB Serial/JTAG, so Enabled
+# (CDCOnBoot=cdc).
+function apply_cdc_on_boot_opt {
+    local fqbn="$1"
+    local board
+    board=$(echo "$fqbn" | cut -d':' -f3)
+    if [ "$board" != "esp32p4" ]; then
+        echo "$fqbn"
+        return 0
+    fi
+
+    local base options cdc_opt
+    base=$(echo "$fqbn" | cut -d':' -f1-3)
+    options=$(echo "$fqbn" | cut -d':' -f4-)
+    if [ "${CI:-false}" = "true" ]; then
+        cdc_opt="CDCOnBoot=default"
+    else
+        cdc_opt="CDCOnBoot=cdc"
+    fi
+    echo "${base}:$(_normalize_fqbn_opts "${options},${cdc_opt}")"
+}
+
+function default_fqbn_for_target {
+    local target="$1"
+    local options_override="${2:-}"
+    local debug_level="${3:-}"
+    local extra_opts="${4:-}"
+    local pkg="${5:-espressif:esp32}"
+    local fqbn_append="${6:-}"
+
+    local opt=""
+
+    # Lowest priority first: per-target defaults, then the test's fqbn_append,
+    # then options the caller asked for, then the debug level from the command
+    # line. Duplicate menu keys are resolved by _normalize_fqbn_opts.
+    local overrides="${fqbn_append},${extra_opts},${debug_level}"
+
+    local esp32_opts esp32s2_opts esp32s3_opts esp32c3_opts esp32c6_opts esp32h2_opts esp32p4_opts esp32c5_opts
+    esp32_opts=$(_normalize_fqbn_opts "PSRAM=enabled,${overrides}")
+    esp32s2_opts=$(_normalize_fqbn_opts "PSRAM=enabled,${overrides}")
+    esp32s3_opts=$(_normalize_fqbn_opts "PSRAM=opi,USBMode=default,${overrides}")
+    esp32c3_opts=$(_normalize_fqbn_opts "${overrides}")
+    esp32c6_opts=$(_normalize_fqbn_opts "${overrides}")
+    esp32h2_opts=$(_normalize_fqbn_opts "${overrides}")
+    esp32p4_opts=$(_normalize_fqbn_opts "PSRAM=enabled,USBMode=hwcdc,ChipVariant=postv3,${overrides}")
+    esp32c5_opts=$(_normalize_fqbn_opts "PSRAM=enabled,${overrides}")
+
+    local result=""
+    case "$target" in
+        esp32)
+            [ -n "${options_override:-$esp32_opts}" ] && opt=":${options_override:-$esp32_opts}"
+            result="${pkg}:esp32${opt}"
+            ;;
+        esp32s2)
+            [ -n "${options_override:-$esp32s2_opts}" ] && opt=":${options_override:-$esp32s2_opts}"
+            result="${pkg}:esp32s2${opt}"
+            ;;
+        esp32c3)
+            [ -n "${options_override:-$esp32c3_opts}" ] && opt=":${options_override:-$esp32c3_opts}"
+            result="${pkg}:esp32c3${opt}"
+            ;;
+        esp32s3)
+            [ -n "${options_override:-$esp32s3_opts}" ] && opt=":${options_override:-$esp32s3_opts}"
+            result="${pkg}:esp32s3${opt}"
+            ;;
+        esp32c6)
+            [ -n "${options_override:-$esp32c6_opts}" ] && opt=":${options_override:-$esp32c6_opts}"
+            result="${pkg}:esp32c6${opt}"
+            ;;
+        esp32h2)
+            [ -n "${options_override:-$esp32h2_opts}" ] && opt=":${options_override:-$esp32h2_opts}"
+            result="${pkg}:esp32h2${opt}"
+            ;;
+        esp32p4)
+            [ -n "${options_override:-$esp32p4_opts}" ] && opt=":${options_override:-$esp32p4_opts}"
+            result="${pkg}:esp32p4${opt}"
+            ;;
+        esp32c5)
+            [ -n "${options_override:-$esp32c5_opts}" ] && opt=":${options_override:-$esp32c5_opts}"
+            result="${pkg}:esp32c5${opt}"
+            ;;
+        *)
+            echo "ERROR: Invalid chip: $target" >&2
+            return 1
+            ;;
+    esac
+    apply_cdc_on_boot_opt "$result"
+}
+
+# Read the fqbn_append options a ci.yml requests for one target. The field is
+# either a string applied to every target, or a map of per-target entries with an
+# optional "default" entry. Map entries are merged with "default", the per-target
+# entry winning, so a test only has to spell out what differs on that target.
+# The field defaults to the top level fqbn_append, but any path can be given so
+# that the per-device fields of a multi-device test resolve the same way.
+function fqbn_append_for_target { # fqbn_append_for_target <ci_yml> <target> [yq_path]
+    local ci_yml="$1"
+    local target="$2"
+    local path="${3:-.fqbn_append}"
+
+    if [ ! -f "$ci_yml" ]; then
+        return 0
+    fi
+
+    local value
+    if [ "$(yq eval "${path} | type" "$ci_yml" 2>/dev/null)" == "!!map" ]; then
+        local common specific
+        common=$(yq eval "${path}.default // \"\"" "$ci_yml" 2>/dev/null)
+        specific=$(yq eval "${path}.\"${target}\" // \"\"" "$ci_yml" 2>/dev/null)
+        value="${common},${specific}"
+    else
+        value=$(yq eval "${path} // \"\"" "$ci_yml" 2>/dev/null)
+    fi
+
+    _normalize_fqbn_opts "$value"
+}
+
+function default_upload_test_fqbn {
+    default_fqbn_for_target "$1" "" "" "UploadSpeed=115200" "${2:-espressif:esp32}"
+}
+
+function split_fqbn_for_cli {
+    local fqbn="$1"
+    CLI_FQBN_OPTIONS=$(echo "$fqbn" | cut -d':' -f4-)
+    CLI_FQBN_BASE=$(echo "$fqbn" | cut -d':' -f1-3)
+}
+
+function build_sketch { # build_sketch <ide_path> <user_path> <path-to-ino> [extra-options]
+    while [ -n "$1" ]; do
+        case "$1" in
+        -ai )
+            shift
+            ide_path=$1
+            ;;
+        -au )
+            shift
+            user_path=$1
+            ;;
+        -t )
+            shift
+            target=$1
+            ;;
+        -fqbn )
+            shift
+            fqbn=$1
+            ;;
+        -o )
+            shift
+            options=$1
+            ;;
+        -s )
+            shift
+            sketchdir=$1
+            ;;
+        -i )
+            shift
+            chunk_index=$1
+            ;;
+        -l )
+            shift
+            log_compilation=$1
+            ;;
+        -d )
+            shift
+            debug_level="DebugLevel=$1"
+            ;;
+        -td )
+            shift
+            ci_yml_dir=$1
+            ;;
+        -bn )
+            shift
+            build_name=$1
+            ;;
+        -fa )
+            shift
+            fqbn_append_override=$1
+            ;;
+        --arduino-cli )
+            use_arduino_cli=1
+            ;;
+        * )
+            break
+            ;;
+        esac
+        shift
+    done
+
+    xtra_opts=("$@")
+    len=0
+
+    if [ -z "$sketchdir" ]; then
+        echo "ERROR: Sketch directory not provided"
+        echo "$USAGE"
+        exit 1
+    fi
+
+    # No FQBN was passed, try to get it from other options
+
+    if [ -z "$fqbn" ]; then
+        if [ -z "$target" ]; then
+            echo "ERROR: Unspecified chip"
+            echo "$USAGE"
+            exit 1
+        fi
+
+        # The options are either stored in the test directory, for a per test
+        # customization or passed as parameters.  Command line options take
+        # precedence.  Note that the following logic also falls to the default
+        # parameters if no arguments were passed and no file was found.
+
+        # Resolve which ci.yml to use for FQBN / fqbn_append lookups.
+        # For multi-device tests (-td), the sub-sketch directory does not
+        # contain its own ci.yml; the parent test directory does.
+        local ci_yml_for_build=""
+        if [ -f "$sketchdir"/ci.yml ]; then
+            ci_yml_for_build="$sketchdir/ci.yml"
+        elif [ -n "$ci_yml_dir" ] && [ -f "$ci_yml_dir/ci.yml" ]; then
+            ci_yml_for_build="$ci_yml_dir/ci.yml"
+        fi
+
+        if [ -z "$options" ] && [ -n "$ci_yml_for_build" ]; then
+            # The config file could contain multiple FQBNs for one chip.  If
+            # that's the case we build one time for every FQBN.
+
+            len=$(yq eval ".fqbn.${target} | length" "$ci_yml_for_build" 2>/dev/null || echo 0)
+            if [ "$len" -gt 0 ]; then
+                fqbn=$(yq eval ".fqbn.${target} | sort | @json" "$ci_yml_for_build")
+            fi
+        fi
+
+        if [ -n "$options" ] || [ "$len" -eq 0 ]; then
+            # Since we are passing options, we will end up with only one FQBN to
+            # build.
+
+            len=1
+
+            # Options passed with -fa are merged on top of the ones the ci.yml
+            # asks for, so a single device of a multi-device test can add to or
+            # override them without losing the ones shared by the whole test.
+            if [ -n "$ci_yml_for_build" ]; then
+                fqbn_append=$(fqbn_append_for_target "$ci_yml_for_build" "$target")
+            fi
+            if [ -n "${fqbn_append_override:-}" ]; then
+                fqbn_append=$(_normalize_fqbn_opts "${fqbn_append},${fqbn_append_override}")
+            fi
+
+            fqbn=$(default_fqbn_for_target "$target" "$options" "${debug_level:-}" "" "espressif:esp32" "$fqbn_append") || exit 1
+            fqbn="[\"$fqbn\"]"
+        fi
+    else
+        # An FQBN was passed.  Make it look like a JSON array.
+
+        len=1
+        fqbn="[\"$fqbn\"]"
+    fi
+
+    if [ -z "$fqbn" ]; then
+        echo "No FQBN passed or invalid chip: $target"
+        exit 1
+    fi
+
+    sketchname=$(basename "$sketchdir")
+    local has_requirements
+
+    if [ -f "$sketchdir"/ci.yml ]; then
+        # If the target is listed as false, skip the sketch. Otherwise, include it.
+        is_target=$(yq eval ".targets.${target}" "$sketchdir"/ci.yml 2>/dev/null)
+        if [[ "$is_target" == "false" ]]; then
+            echo "Skipping $sketchname for target $target"
+            exit 0
+        fi
+
+        has_requirements=$(check_requirements "$sketchdir" "$SDKCONFIG_DIR/$target/sdkconfig")
+        if [ "$has_requirements" == "0" ]; then
+            echo "Target $target does not meet the requirements for $sketchname. Skipping."
+            exit 0
+        fi
+    fi
+
+    # Install libraries from ci.yml if they exist
+    local ci_yml_lib_dir="${ci_yml_dir:-$sketchdir}"
+    install_libs -ai "$ide_path" -s "$ci_yml_lib_dir"
+    install_result=$?
+    if [ $install_result -ne 0 ]; then
+        echo "ERROR: Library installation failed for $sketchname" >&2
+        exit $install_result
+    fi
+
+    # Build directory path:
+    #   ARDUINO_BUILD_DIR env var → full override (used by on-push.sh for non-test builds)
+    #   Otherwise → ~/.arduino/tests/$target/$build_output_name/build[N].tmp
+    #     -bn sets a parent directory (test name) for multi-device builds:
+    #       e.g. -bn wifi_ap + sketchname=ap → wifi_ap/ap/build.tmp
+    #     Without -bn, uses $sketchname directly:
+    #       e.g. sketchname=gpio → gpio/build.tmp
+    local build_output_name="${build_name:+$build_name/}$sketchname"
+
+    ARDUINO_CACHE_DIR="$HOME/.arduino/cache.tmp"
+    output_file="$HOME/.arduino/cli_compile_output.txt"
+    sizes_file="$GITHUB_WORKSPACE/cli_compile_$chunk_index.json"
+
+    mkdir -p "$ARDUINO_CACHE_DIR"
+    for i in $(seq 0 $((len - 1))); do
+        if [ -n "$ARDUINO_BUILD_DIR" ]; then
+            # Full override from env var (non-test builds like on-push.sh)
+            build_dir="$ARDUINO_BUILD_DIR"
+        elif [ "$len" -eq 1 ]; then
+            build_dir="$HOME/.arduino/tests/$target/$build_output_name/build.tmp"
+        else
+            build_dir="$HOME/.arduino/tests/$target/$build_output_name/build$i.tmp"
+        fi
+        mkdir -p "$build_dir"
+
+        currfqbn=$(echo "$fqbn" | jq -r --argjson i "$i" '.[$i]')
+        currfqbn=$(apply_cdc_on_boot_opt "$currfqbn")
+
+        local compile_start compile_end
+        compile_start=$(date +%s.%N 2>/dev/null || date +%s)
+
+        if [ "${use_arduino_cli:-0}" -eq 1 ] && [ -f "$ide_path/arduino-cli" ]; then
+            echo "Building $sketchname with arduino-cli and FQBN=$currfqbn"
+            split_fqbn_for_cli "$currfqbn"
+            local curroptions="$CLI_FQBN_OPTIONS"
+            local currcli_fqbn="$CLI_FQBN_BASE"
+            "$ide_path"/arduino-cli compile \
+                --fqbn "$currcli_fqbn" \
+                --board-options "$curroptions" \
+                --warnings "all" \
+                --build-property "compiler.warning_flags.all=-Wall -Werror=all -Wextra" \
+                --build-path "$build_dir" \
+                "${xtra_opts[@]}" "${sketchdir}" \
+                2>&1 | tee "$output_file"
+        elif [ "${use_arduino_cmake:-0}" -eq 0 ] && [ -f "$REPO_ROOT/tools/arduino_cmake.py" ]; then
+            echo "Building $sketchname with arduino_cmake.py and FQBN=$currfqbn"
+            python3 "$REPO_ROOT/tools/arduino_cmake.py" compile \
+                --fqbn "$currfqbn" \
+                --warnings "all" \
+                --build-property "compiler.warning_flags.all=-Wall -Werror=all -Wextra" \
+                --build-path "$build_dir" \
+                "${xtra_opts[@]}" --sketch "${sketchdir}" \
+                2>&1 | tee "$output_file"
+        else
+            echo "ERROR: Requested build tool not found (arduino-cli or arduino_cmake.py)"
+            exit 1
+        fi
+
+        exit_status=${PIPESTATUS[0]}
+        compile_end=$(date +%s.%N 2>/dev/null || date +%s)
+        if [ -n "${SKETCH_TIMES_FILE:-}" ]; then
+            local sketch_key
+            # Relative paths from assign_chunks.py are "libraries/...";
+            # installed paths are ".../libraries/...". Require only "libraries/".
+            if [[ "$sketchdir" == *libraries/* ]]; then
+                sketch_key="libraries/${sketchdir#*libraries/}/$(basename "$sketchdir").ino"
+            else
+                sketch_key="$(basename "$sketchdir")/$(basename "$sketchdir").ino"
+            fi
+            SKETCH_KEY="$sketch_key" SKETCH_TARGET="$target" \
+            COMPILE_START="$compile_start" COMPILE_END="$compile_end" \
+            python3 -c 'import json, os; print(json.dumps({"sketch": os.environ["SKETCH_KEY"], "target": os.environ["SKETCH_TARGET"], "wall_s": round(float(os.environ["COMPILE_END"]) - float(os.environ["COMPILE_START"]), 3)}))' >> "$SKETCH_TIMES_FILE"
+        fi
+        if [ "$exit_status" -ne 0 ]; then
+            echo "ERROR: Compilation failed with error code $exit_status"
+            exit "$exit_status"
+        fi
+
+        # Copy ci.yml alongside compiled binaries for later consumption by reporting tools.
+        # For multi-device tests, ci.yml lives in the parent test directory (-td),
+        # not in individual sketch directories.
+        local ci_yml_source="${ci_yml_dir:-$sketchdir}"
+        if [ -f "$ci_yml_source/ci.yml" ]; then
+            cp -f "$ci_yml_source/ci.yml" "$build_dir/ci.yml" 2>/dev/null || true
+        fi
+
+        if [ -n "$COMPILE_COMMANDS_DIR" ] && [ -f "$build_dir/compile_commands.json" ]; then
+            mkdir -p "$COMPILE_COMMANDS_DIR"
+            # Use a path-based unique name to avoid collisions when multiple sketches share
+            # the same basename (e.g. two sketches both named LeaderNode in different subdirs).
+            # Strip the prefix up to and including the first occurrence of "/libraries/" so
+            # the result is relative and readable; fall back to the full path if not found.
+            local sketch_relpath="${sketchdir#*/libraries/}"
+            local sketch_safe="${sketch_relpath//\//_}"  # replace all '/' with '_'
+            sketch_safe="${sketch_safe#_}"               # strip any leading underscore
+            jq --arg t "$target" '[.[] | . + {_target: $t}]' \
+                "$build_dir/compile_commands.json" > "$COMPILE_COMMANDS_DIR/${target}_${sketch_safe}.json"
+        fi
+
+        if [ -n "$log_compilation" ]; then
+            flash_bytes=$(grep -oE 'Sketch uses ([0-9]+) bytes' "$output_file" | awk '{print $3}')
+            flash_percentage=$(grep -oE 'Sketch uses ([0-9]+) bytes \(([0-9]+)%\)' "$output_file" | awk '{print $5}' | tr -d '(%)')
+            ram_bytes=$(grep -oE 'Global variables use ([0-9]+) bytes' "$output_file" | awk '{print $4}')
+            ram_percentage=$(grep -oE 'Global variables use ([0-9]+) bytes \(([0-9]+)%\)' "$output_file" | awk '{print $6}' | tr -d '(%)')
+
+            constant_part="/home/runner/Arduino/hardware/espressif/esp32/libraries/"
+            lib_sketch_name="${sketchdir#"$constant_part"}"
+            echo "{\"name\": \"$lib_sketch_name\",
+                \"sizes\": [{
+                        \"flash_bytes\": $flash_bytes,
+                        \"flash_percentage\": $flash_percentage,
+                        \"ram_bytes\": $ram_bytes,
+                        \"ram_percentage\": $ram_percentage
+                        }]
+                }," >> "$sizes_file"
+        fi
+    done
+
+    unset fqbn
+    unset xtra_opts
+    unset options
+}
+
+function count_sketches { # count_sketches <path> [target] [ignore-requirements] [file]
+    local path=$1
+    local target=$2
+    local ignore_requirements=$3
+    local file=$4
+    local sketches
+
+    if [ $# -lt 1 ]; then
+        echo "ERROR: Illegal number of parameters"
+        echo "USAGE: ${0} count <path> [target]"
+    fi
+
+    rm -rf sketches.txt
+    touch sketches.txt
+    if [ ! -d "$path" ]; then
+        return 0
+    fi
+
+    if [ -f "$file" ]; then
+        sketches=$(cat "$file" | sort)
+    else
+        sketches=$(find "$path" -name '*.ino' | sort)
+    fi
+
+    local sketchnum=0
+    for sketch in $sketches; do
+        local sketchdir
+        local sketchdirname
+        local sketchname
+        local has_requirements
+        local parent_dir
+
+        sketchdir=$(dirname "$sketch")
+        sketchdirname=$(basename "$sketchdir")
+        sketchname=$(basename "$sketch")
+        parent_dir=$(dirname "$sketchdir")
+
+        if [[ "$sketchdirname.ino" != "$sketchname" ]]; then
+            continue
+        # Skip sketches that are part of multi-device tests (they are built separately)
+        elif [[ -f "$parent_dir/ci.yml" ]]; then
+            local has_multi_device
+            has_multi_device=$(yq eval '.multi_device' "$parent_dir/ci.yml" 2>/dev/null)
+            if [[ "$has_multi_device" != "null" && "$has_multi_device" != "" ]]; then
+                continue
+            fi
+        fi
+
+        if [[ -n $target ]] && [[ -f $sketchdir/ci.yml ]]; then
+            # If the target is listed as false, skip the sketch. Otherwise, include it.
+            is_target=$(yq eval ".targets.${target}" "$sketchdir"/ci.yml 2>/dev/null)
+            if [[ "$is_target" == "false" ]]; then
+                continue
+            fi
+
+            if [ "$ignore_requirements" != "1" ]; then
+                has_requirements=$(check_requirements "$sketchdir" "$SDKCONFIG_DIR/$target/sdkconfig")
+                if [ "$has_requirements" == "0" ]; then
+                    continue
+                fi
+            fi
+        fi
+        echo "$sketch" >> sketches.txt
+        sketchnum=$((sketchnum + 1))
+    done
+    # Echo count to stdout instead of using return code (which is limited to 0-255)
+    echo "$sketchnum"
+}
+
+function build_sketches { # build_sketches <ide_path> <user_path> <target> <path> <chunk> <total-chunks> [extra-options]
+    local args=()
+    while [ -n "$1" ]; do
+        case $1 in
+        -ai )
+            shift
+            ide_path=$1
+            ;;
+        -au )
+            shift
+            user_path=$1
+            ;;
+        -t )
+            shift
+            target=$1
+            args+=("-t" "$target")
+            ;;
+        -fqbn )
+            shift
+            fqbn=$1
+            args+=("-fqbn" "$fqbn")
+            ;;
+        -p )
+            shift
+            path=$1
+            ;;
+        -i )
+            shift
+            chunk_index=$1
+            ;;
+        -m )
+            shift
+            chunk_max=$1
+            ;;
+        -l )
+            shift
+            log_compilation=$1
+            ;;
+        -f )
+            shift
+            sketches_file=$1
+            ;;
+        -d )
+            shift
+            debug_level="$1"
+            args+=("-d" "$debug_level")
+            ;;
+        --arduino-cli )
+            args+=("--arduino-cli")
+            ;;
+        * )
+            break
+            ;;
+        esac
+        shift
+    done
+
+    local xtra_opts=("$@")
+
+    if [ -z "$chunk_index" ] || [ -z "$chunk_max" ]; then
+        echo "ERROR: Invalid chunk parameters"
+        echo "$USAGE"
+        exit 1
+    fi
+
+    if [ "$chunk_max" -le 0 ]; then
+        echo "ERROR: Chunks count must be positive number"
+        return 1
+    fi
+
+    if [ "$chunk_index" -gt "$chunk_max" ] && [ "$chunk_max" -ge 2 ]; then
+        chunk_index=$chunk_max
+    fi
+
+    set +e
+    if [ -n "$sketches_file" ]; then
+        local sketchcount=$(count_sketches "$path" "$target" "0" "$sketches_file")
+    else
+        local sketchcount=$(count_sketches "$path" "$target")
+    fi
+    set -e
+    local sketches
+    sketches=$(cat sketches.txt)
+    rm -rf sketches.txt
+
+    local chunk_size
+    local start_index=0
+    local end_index=0
+    if [ -n "$sketches_file" ]; then
+        # File is already the assigned set. -i is only the size-report name.
+        chunk_size=$sketchcount
+        end_index=$sketchcount
+    else
+        local all_chunks
+        chunk_size=$(( sketchcount / chunk_max ))
+        all_chunks=$(( chunk_max * chunk_size ))
+        if [ "$all_chunks" -lt "$sketchcount" ]; then
+            chunk_size=$(( chunk_size + 1 ))
+        fi
+        if [ "$chunk_index" -ge "$chunk_max" ]; then
+            start_index=$chunk_index
+            end_index=$sketchcount
+        else
+            start_index=$(( chunk_index * chunk_size ))
+            if [ "$sketchcount" -le "$start_index" ]; then
+                echo "No sketches to build for $target in this chunk"
+                return 0
+            fi
+            end_index=$(( $(( chunk_index + 1 )) * chunk_size ))
+            if [ "$end_index" -gt "$sketchcount" ]; then
+                end_index=$sketchcount
+            fi
+        fi
+    fi
+
+    local start_num
+    start_num=$(( start_index + 1 ))
+    echo "Found $sketchcount Sketches for target '$target'";
+    echo "Chunk Index : $chunk_index"
+    echo "Chunk Count : $chunk_max"
+    echo "Chunk Size  : $chunk_size"
+    echo "Start Sketch: $start_num"
+    echo "End Sketch  : $end_index"
+
+    #if fqbn is not passed then set it to default for compilation log
+    if [ -z "$fqbn" ]; then
+        log_fqbn="espressif:esp32:$target"
+    else
+        log_fqbn=$fqbn
+    fi
+
+    sizes_file="$GITHUB_WORKSPACE/cli_compile_$chunk_index.json"
+    if [ -n "$log_compilation" ]; then
+        #echo board,target and start of sketches to sizes_file json
+        echo "{ \"board\": \"$log_fqbn\",
+                \"target\": \"$target\",
+                \"sketches\": [" >> "$sizes_file"
+    fi
+
+    local sketchnum=0
+    args+=("-ai" "$ide_path" "-au" "$user_path" "-i" "$chunk_index")
+    if [ -n "$log_compilation" ]; then
+        args+=("-l" "$log_compilation")
+    fi
+    for sketch in $sketches; do
+        local sketchdir
+        local sketchdirname
+
+        sketchdir=$(dirname "$sketch")
+        sketchdirname=$(basename "$sketchdir")
+        sketchnum=$((sketchnum + 1))
+
+        if [ "$sketchnum" -le "$start_index" ] \
+        || [ "$sketchnum" -gt "$end_index" ]; then
+            continue
+        fi
+        echo ""
+        echo "Building Sketch Index $sketchnum - $sketchdirname"
+        build_sketch "${args[@]}" -s "$sketchdir" "${xtra_opts[@]}"
+        local result=$?
+        if [ $result -ne 0 ]; then
+            return $result
+        fi
+    done
+
+    if [ -n "$log_compilation" ]; then
+        #remove last comma from json
+        if [ "$i" -eq $((len - 1)) ]; then
+            sed -i '$ s/.$//' "$sizes_file"
+        fi
+        #echo end of sketches sizes_file json
+        echo "]" >> "$sizes_file"
+        #echo end of board sizes_file json
+        echo "}," >> "$sizes_file"
+    fi
+
+    return 0
+}
+
+# Return 0 if the string looks like a git URL we should pass to --git-url
+is_git_like_url() {
+    local u=$1
+    [[ "$u" =~ ^https?://.+ ]] || [[ "$u" =~ ^git@[^:]+:.+ ]]
+}
+
+# If status!=0, print errors/warnings from captured output (fallback to full output)
+print_err_warnings() {
+    local status=$1; shift
+    local out=$*
+    if [ "$status" -ne 0 ]; then
+        printf '%s\n' "$out" | grep -Ei "error|warning|warn" >&2 || printf '%s\n' "$out" >&2
+    fi
+}
+
+function install_libs { # install_libs [-ai <cli_path>] -s <sketchdir> [-v]
+    local ide_path=""
+    local sketchdir=""
+    local verbose=false
+
+    while [ -n "$1" ]; do
+        case "$1" in
+        -ai ) shift; ide_path=$1 ;;
+        -s  ) shift; sketchdir=$1 ;;
+        -v  ) verbose=true ;;
+        * )
+            echo "ERROR: Unknown argument: $1" >&2
+            echo "USAGE: install_libs [-ai <cli_path>] -s <sketchdir> [-v]" >&2
+            return 1
+            ;;
+        esac
+        shift
+    done
+
+    if [ -z "$sketchdir" ]; then
+        echo "ERROR: Sketch directory not provided" >&2
+        echo "USAGE: install_libs [-ai <cli_path>] -s <sketchdir> [-v]" >&2
+        return 1
+    fi
+
+    if [ ! -f "$sketchdir/ci.yml" ]; then
+        [ "$verbose" = true ] && echo "No ci.yml found in $sketchdir, skipping library installation"
+        return 0
+    fi
+    if ! yq eval '.' "$sketchdir/ci.yml" >/dev/null 2>&1; then
+        echo "ERROR: $sketchdir/ci.yml is not valid YAML" >&2
+        return 1
+    fi
+
+    local libs_type
+    libs_type=$(yq eval '.libs | type' "$sketchdir/ci.yml" 2>/dev/null)
+    if [ -z "$libs_type" ] || [ "$libs_type" = "null" ] || [ "$libs_type" = "!!null" ]; then
+        [ "$verbose" = true ] && echo "No libs field found in ci.yml, skipping library installation"
+        return 0
+    elif [ "$libs_type" != "!!seq" ]; then
+        echo "ERROR: libs field in ci.yml must be an array, found: $libs_type" >&2
+        return 1
+    fi
+
+    local libs_count
+    libs_count=$(yq eval '.libs | length' "$sketchdir/ci.yml" 2>/dev/null)
+    if [ "$libs_count" -eq 0 ]; then
+        [ "$verbose" = true ] && echo "libs array is empty in ci.yml, skipping library installation"
+        return 0
+    fi
+
+    if [ -z "$ide_path" ] || [ ! -f "$ide_path/arduino-cli" ]; then
+        echo "arduino-cli not found, installing for library support..."
+        source "${SCRIPTS_DIR}/install-arduino-cli.sh"
+        ide_path="$ARDUINO_IDE_PATH"
+        if [ ! -f "$ide_path/arduino-cli" ]; then
+            echo "ERROR: Failed to install arduino-cli" >&2
+            return 1
+        fi
+    fi
+
+    echo "Installing $libs_count libraries from $sketchdir/ci.yml"
+
+    local needs_unsafe=false
+    local original_unsafe_setting=""
+    local libs
+    libs=$(yq eval '.libs[]' "$sketchdir/ci.yml" 2>/dev/null)
+
+    # Detect any git-like URL (GitHub/GitLab/Bitbucket/self-hosted/ssh)
+    for lib in $libs; do
+        if is_git_like_url "$lib"; then
+            needs_unsafe=true
+            break
+        fi
+    done
+
+    if [ "$needs_unsafe" = true ]; then
+        [ "$verbose" = true ] && echo "Checking current unsafe install setting..."
+        original_unsafe_setting=$("$ide_path/arduino-cli" config get library.enable_unsafe_install 2>/dev/null || echo "false")
+        if [ "$original_unsafe_setting" = "false" ]; then
+            [ "$verbose" = true ] && echo "Enabling unsafe installs for Git URLs..."
+            "$ide_path/arduino-cli" config set library.enable_unsafe_install true >/dev/null 2>&1 || \
+                echo "WARNING: Failed to enable unsafe installs, Git URL installs may fail" >&2
+        else
+            [ "$verbose" = true ] && echo "Unsafe installs already enabled"
+        fi
+    fi
+
+    local rc=0 install_status=0 output=""
+    for lib in $libs; do
+        [ "$verbose" = true ] && echo "Processing library: $lib"
+
+        if is_git_like_url "$lib"; then
+            [ "$verbose" = true ] && echo "Installing library from git URL: $lib"
+            if [ "$verbose" = true ]; then
+                "$ide_path/arduino-cli" lib install --git-url "$lib"
+                install_status=$?
+            else
+                output=$("$ide_path/arduino-cli" lib install --git-url "$lib" 2>&1)
+                install_status=$?
+            fi
+        else
+            [ "$verbose" = true ] && echo "Installing library by name: $lib"
+            if [ "$verbose" = true ]; then
+                "$ide_path/arduino-cli" lib install "$lib"
+                install_status=$?
+            else
+                output=$("$ide_path/arduino-cli" lib install "$lib" 2>&1)
+                install_status=$?
+            fi
+        fi
+
+        # Treat "already installed"/"up to date" as success (idempotent)
+        if [ $install_status -ne 0 ] && echo "$output" | grep -qiE 'already installed|up to date'; then
+            install_status=0
+        fi
+
+        if [ "$verbose" != true ]; then
+            print_err_warnings "$install_status" "$output"
+        fi
+
+        if [ $install_status -ne 0 ]; then
+            echo "ERROR: Failed to install library: $lib" >&2
+            rc=$install_status
+            break
+        else
+            [ "$verbose" = true ] && echo "Successfully installed library: $lib"
+        fi
+    done
+
+    if [ "$needs_unsafe" = true ] && [ "$original_unsafe_setting" = "false" ]; then
+        [ "$verbose" = true ] && echo "Restoring original unsafe install setting..."
+        "$ide_path/arduino-cli" config set library.enable_unsafe_install false >/dev/null 2>&1 || true
+    fi
+
+    [ $rc -eq 0 ] && echo "Library installation completed"
+    return $rc
+}
+
+
+USAGE="
+USAGE: ${0} [command] [options]
+Available commands:
+    count: Count sketches.
+    build: Build a sketch.
+    chunk_build: Build a chunk of sketches.
+    check_requirements: Check if target meets sketch requirements.
+    install_libs: Install libraries from ci.yml file.
+    default_upload_test_fqbn: Print default mock-upload FQBN for a SoC (target [pkg_prefix]).
+    fqbn_append: Print the fqbn_append options a ci.yml sets for a target (ci_yml target [yq_path]).
+"
+
+cmd=$1
+shift
+if [ -z "$cmd" ]; then
+    echo "ERROR: No command supplied"
+    echo "$USAGE"
+    exit 2
+fi
+
+case "$cmd" in
+    "count") count_sketches "$@"
+    ;;
+    "build") build_sketch "$@"
+    ;;
+    "chunk_build") build_sketches "$@"
+    ;;
+    "check_requirements") check_requirements "$@"
+    ;;
+    "install_libs") install_libs "$@"
+    ;;
+    "default_upload_test_fqbn") default_upload_test_fqbn "$@"
+    ;;
+    "fqbn_append") fqbn_append_for_target "$@"
+    ;;
+    *)
+        echo "ERROR: Unrecognized command"
+        echo "$USAGE"
+        exit 2
+    esac

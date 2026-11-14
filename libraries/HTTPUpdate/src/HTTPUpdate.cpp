@@ -25,126 +25,151 @@
 
 #include "HTTPUpdate.h"
 #include <StreamString.h>
+#if SOC_WIFI_SUPPORTED
+#include "WiFi.h"
+#endif
 
 #include <esp_partition.h>
-#include <esp_ota_ops.h>                // get running partition
+#include <esp_ota_ops.h>  // get running partition
 
 // To do extern "C" uint32_t _SPIFFS_start;
 // To do extern "C" uint32_t _SPIFFS_end;
 
-HTTPUpdate::HTTPUpdate(void)
-        : _httpClientTimeout(8000), _ledPin(-1)
-{
+HTTPUpdate::HTTPUpdate(int httpClientTimeout, UpdateClass *updater)
+  : _httpClientTimeout(httpClientTimeout), _updater(updater), _followRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS) {}
+
+HTTPUpdate::~HTTPUpdate(void) {}
+
+HTTPUpdateResult HTTPUpdate::update(NetworkClient &client, const String &url, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return HTTP_UPDATE_FAILED;
+  }
+  return handleUpdate(http, currentVersion, U_FLASH, requestCB);
 }
 
-HTTPUpdate::HTTPUpdate(int httpClientTimeout)
-        : _httpClientTimeout(httpClientTimeout), _ledPin(-1)
-{
+HTTPUpdateResult HTTPUpdate::updateFs(HTTPClient &httpClient, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  return handleUpdate(httpClient, currentVersion, U_FLASHFS, requestCB);
 }
 
-HTTPUpdate::~HTTPUpdate(void)
-{
+HTTPUpdateResult HTTPUpdate::updateSpiffs(HTTPClient &httpClient, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  return handleUpdate(httpClient, currentVersion, U_SPIFFS, requestCB);
 }
 
-HTTPUpdateResult HTTPUpdate::update(WiFiClient& client, const String& url, const String& currentVersion)
-{
-    HTTPClient http;
-    if(!http.begin(client, url))
-    {
-        return HTTP_UPDATE_FAILED;
-    }
-    return handleUpdate(http, currentVersion, false);
+HTTPUpdateResult HTTPUpdate::updateFatfs(HTTPClient &httpClient, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  return handleUpdate(httpClient, currentVersion, U_FATFS, requestCB);
 }
 
-HTTPUpdateResult HTTPUpdate::updateSpiffs(WiFiClient& client, const String& url, const String& currentVersion)
-{
-    HTTPClient http;
-    if(!http.begin(client, url))
-    {
-        return HTTP_UPDATE_FAILED;
-    }
-    return handleUpdate(http, currentVersion, true);
+HTTPUpdateResult HTTPUpdate::updateLittlefs(HTTPClient &httpClient, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  return handleUpdate(httpClient, currentVersion, U_LITTLEFS, requestCB);
 }
 
-HTTPUpdateResult HTTPUpdate::update(WiFiClient& client, const String& host, uint16_t port, const String& uri,
-        const String& currentVersion)
-{
-    HTTPClient http;
-    if(!http.begin(client, host, port, uri))
-    {
-        return HTTP_UPDATE_FAILED;
-    }
-    return handleUpdate(http, currentVersion, false);
+HTTPUpdateResult HTTPUpdate::updateFs(NetworkClient &client, const String &url, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return HTTP_UPDATE_FAILED;
+  }
+  return handleUpdate(http, currentVersion, U_FLASHFS, requestCB);
+}
+
+HTTPUpdateResult HTTPUpdate::updateSpiffs(NetworkClient &client, const String &url, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return HTTP_UPDATE_FAILED;
+  }
+  return handleUpdate(http, currentVersion, U_SPIFFS, requestCB);
+}
+
+HTTPUpdateResult HTTPUpdate::updateFatfs(NetworkClient &client, const String &url, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return HTTP_UPDATE_FAILED;
+  }
+  return handleUpdate(http, currentVersion, U_FATFS, requestCB);
+}
+
+HTTPUpdateResult HTTPUpdate::updateLittlefs(NetworkClient &client, const String &url, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return HTTP_UPDATE_FAILED;
+  }
+  return handleUpdate(http, currentVersion, U_LITTLEFS, requestCB);
+}
+
+HTTPUpdateResult HTTPUpdate::update(HTTPClient &httpClient, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  return handleUpdate(httpClient, currentVersion, U_FLASH, requestCB);
+}
+
+HTTPUpdateResult
+  HTTPUpdate::update(NetworkClient &client, const String &host, uint16_t port, const String &uri, const String &currentVersion, HTTPUpdateRequestCB requestCB) {
+  HTTPClient http;
+  if (!http.begin(client, host, port, uri)) {
+    return HTTP_UPDATE_FAILED;
+  }
+  return handleUpdate(http, currentVersion, U_FLASH, requestCB);
 }
 
 /**
  * return error code as int
  * @return int error code
  */
-int HTTPUpdate::getLastError(void)
-{
-    return _lastError;
+int HTTPUpdate::getLastError(void) {
+  return _lastError;
 }
 
 /**
  * return error code as String
  * @return String error
  */
-String HTTPUpdate::getLastErrorString(void)
-{
+String HTTPUpdate::getLastErrorString(void) {
+  if (!_updater) {
+    return {};
+  }
 
-    if(_lastError == 0) {
-        return String(); // no error
-    }
+  if (_lastError == 0) {
+    return String();  // no error
+  }
 
-    // error from Update class
-    if(_lastError > 0) {
-        StreamString error;
-        Update.printError(error);
-        error.trim(); // remove line ending
-        return String("Update error: ") + error;
-    }
+  // error from Update class
+  if (_lastError > 0) {
+    StreamString error;
+    _updater->printError(error);
+    error.trim();  // remove line ending
+    return String("Update error: ") + error;
+  }
 
-    // error from http client
-    if(_lastError > -100) {
-        return String("HTTP error: ") + HTTPClient::errorToString(_lastError);
-    }
+  // error from http client
+  if (_lastError > -100) {
+    return String("HTTP error: ") + HTTPClient::errorToString(_lastError);
+  }
 
-    switch(_lastError) {
-    case HTTP_UE_TOO_LESS_SPACE:
-        return "Not Enough space";
-    case HTTP_UE_SERVER_NOT_REPORT_SIZE:
-        return "Server Did Not Report Size";
-    case HTTP_UE_SERVER_FILE_NOT_FOUND:
-        return "File Not Found (404)";
-    case HTTP_UE_SERVER_FORBIDDEN:
-        return "Forbidden (403)";
-    case HTTP_UE_SERVER_WRONG_HTTP_CODE:
-        return "Wrong HTTP Code";
-    case HTTP_UE_SERVER_FAULTY_MD5:
-        return "Wrong MD5";
-    case HTTP_UE_BIN_VERIFY_HEADER_FAILED:
-        return "Verify Bin Header Failed";
-    case HTTP_UE_BIN_FOR_WRONG_FLASH:
-        return "New Binary Does Not Fit Flash Size";
-    case HTTP_UE_NO_PARTITION:
-        return "Partition Could Not be Found";
-    }
+  switch (_lastError) {
+    case HTTP_UE_TOO_LESS_SPACE:           return "Not Enough space";
+    case HTTP_UE_SERVER_NOT_REPORT_SIZE:   return "Server Did Not Report Size";
+    case HTTP_UE_SERVER_FILE_NOT_FOUND:    return "File Not Found (404)";
+    case HTTP_UE_SERVER_FORBIDDEN:         return "Forbidden (403)";
+    case HTTP_UE_SERVER_WRONG_HTTP_CODE:   return "Wrong HTTP Code";
+    case HTTP_UE_SERVER_FAULTY_MD5:        return "Wrong MD5";
+    case HTTP_UE_BIN_VERIFY_HEADER_FAILED: return "Verify Bin Header Failed";
+    case HTTP_UE_BIN_FOR_WRONG_FLASH:      return "New Binary Does Not Fit Flash Size";
+    case HTTP_UE_NO_PARTITION:             return "Partition Could Not be Found";
+    case HTTP_UE_SERVER_FAULTY_SHA256:     return "Wrong SHA256";
+    case HTTP_UE_SERVER_FAULTY_SHA512:     return "Wrong SHA512";
+  }
 
-    return String();
+  return String();
 }
 
-
 String getSketchSHA256() {
-  const size_t HASH_LEN = 32; // SHA-256 digest length
+  const size_t HASH_LEN = 32;  // SHA-256 digest length
 
-  uint8_t sha_256[HASH_LEN] = { 0 };
+  uint8_t sha_256[HASH_LEN] = {0};
 
-// get sha256 digest for running partition
-  if(esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256) == 0) {
+  // get sha256 digest for running partition
+  if (esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256) == 0) {
     char buffer[2 * HASH_LEN + 1];
 
-    for(size_t index = 0; index < HASH_LEN; index++) {
+    for (size_t index = 0; index < HASH_LEN; index++) {
       uint8_t nibble = (sha_256[index] & 0xf0) >> 4;
       buffer[2 * index] = nibble < 10 ? char(nibble + '0') : char(nibble - 10 + 'A');
 
@@ -167,129 +192,216 @@ String getSketchSHA256() {
  * @param currentVersion const char *
  * @return HTTPUpdateResult
  */
-HTTPUpdateResult HTTPUpdate::handleUpdate(HTTPClient& http, const String& currentVersion, bool spiffs)
-{
+HTTPUpdateResult HTTPUpdate::handleUpdate(HTTPClient &http, const String &currentVersion, uint8_t type, HTTPUpdateRequestCB requestCB) {
 
-    HTTPUpdateResult ret = HTTP_UPDATE_FAILED;
+  HTTPUpdateResult ret = HTTP_UPDATE_FAILED;
 
-    // use HTTP/1.0 for update since the update handler not support any transfer Encoding
-    http.useHTTP10(true);
-    http.setTimeout(_httpClientTimeout);
-    http.setUserAgent("ESP32-http-Update");
-    http.addHeader("Cache-Control", "no-cache");
-    http.addHeader("x-ESP32-STA-MAC", WiFi.macAddress());
-    http.addHeader("x-ESP32-AP-MAC", WiFi.softAPmacAddress());
-    http.addHeader("x-ESP32-free-space", String(ESP.getFreeSketchSpace()));
-    http.addHeader("x-ESP32-sketch-size", String(ESP.getSketchSize()));
-    String sketchMD5 = ESP.getSketchMD5();
-    if(sketchMD5.length() != 0) {
-        http.addHeader("x-ESP32-sketch-md5", sketchMD5);
-    }
-    // Add also a SHA256
-    String sketchSHA256 = getSketchSHA256();
-    if(sketchSHA256.length() != 0) {
-      http.addHeader("x-ESP32-sketch-sha256", sketchSHA256);
-    }
-    http.addHeader("x-ESP32-chip-size", String(ESP.getFlashChipSize()));
-    http.addHeader("x-ESP32-sdk-version", ESP.getSdkVersion());
+  // Prefetch checksum sidecars before the firmware GET when an explicit digest is
+  // not already set. Response headers can still override a successful prefetch.
+  String md5;
+  String sha256;
+  String sha512;
+  uint8_t sidecarFailures = 0;
+  if (_checksumSidecarFetch) {
+    uint8_t requested = (!_md5SumUrl.isEmpty() && _md5Sum.isEmpty() ? SIDECAR_MD5_FAILED : 0)
+                        | (!_sha256SumUrl.isEmpty() && _sha256Sum.isEmpty() ? SIDECAR_SHA256_FAILED : 0)
+                        | (!_sha512SumUrl.isEmpty() && _sha512Sum.isEmpty() ? SIDECAR_SHA512_FAILED : 0);
+    sidecarFailures = _checksumSidecarFetch(
+      http.getClient(), _md5SumUrl, _sha256SumUrl, _sha512SumUrl, requested, md5, sha256, sha512, _httpClientTimeout, _followRedirects, http.getRedirectLimit()
+    );
+  }
 
-    if(spiffs) {
-        http.addHeader("x-ESP32-mode", "spiffs");
-    } else {
-        http.addHeader("x-ESP32-mode", "sketch");
-    }
+  // use HTTP/1.0 for update since the update handler not support any transfer Encoding
+  http.useHTTP10(true);
+  http.setTimeout(_httpClientTimeout);
+  http.setFollowRedirects(_followRedirects);
+  http.setUserAgent("ESP32-http-Update");
+  http.addHeader("Cache-Control", "no-cache");
+  http.addHeader("x-ESP32-BASE-MAC", Network.macAddress());
+#if SOC_WIFI_SUPPORTED
+  http.addHeader("x-ESP32-STA-MAC", WiFi.macAddress());
+  http.addHeader("x-ESP32-AP-MAC", WiFi.softAPmacAddress());
+#endif
+  http.addHeader("x-ESP32-free-space", String(ESP.getFreeSketchSpace()));
+  http.addHeader("x-ESP32-sketch-size", String(ESP.getSketchSize()));
+  String sketchMD5 = ESP.getSketchMD5();
+  if (sketchMD5.length() != 0) {
+    http.addHeader("x-ESP32-sketch-md5", sketchMD5);
+  }
+  // Add also a SHA256
+  String sketchSHA256 = getSketchSHA256();
+  if (sketchSHA256.length() != 0) {
+    http.addHeader("x-ESP32-sketch-sha256", sketchSHA256);
+  }
+  http.addHeader("x-ESP32-chip-size", String(ESP.getFlashChipSize()));
+  http.addHeader("x-ESP32-sdk-version", ESP.getSdkVersion());
 
-    if(currentVersion && currentVersion[0] != 0x00) {
-        http.addHeader("x-ESP32-version", currentVersion);
-    }
+  if (type == U_SPIFFS) {
+    http.addHeader("x-ESP32-mode", "spiffs");
+  } else if (type == U_FATFS) {
+    http.addHeader("x-ESP32-mode", "fatfs");
+  } else if (type == U_LITTLEFS) {
+    http.addHeader("x-ESP32-mode", "littlefs");
+  } else if (type == U_FLASHFS) {
+    http.addHeader("x-ESP32-mode", "flashfs");
+  } else {
+    http.addHeader("x-ESP32-mode", "sketch");
+  }
 
-    const char * headerkeys[] = { "x-MD5" };
-    size_t headerkeyssize = sizeof(headerkeys) / sizeof(char*);
+  if (currentVersion && currentVersion[0] != 0x00) {
+    http.addHeader("x-ESP32-version", currentVersion);
+  }
+  if (requestCB) {
+    requestCB(&http);
+  }
 
-    // track these headers
-    http.collectHeaders(headerkeys, headerkeyssize);
+  if (!_user.isEmpty() && !_password.isEmpty()) {
+    http.setAuthorization(_user.c_str(), _password.c_str());
+  }
 
+  if (!_auth.isEmpty()) {
+    http.setAuthorization(_auth.c_str());
+  }
 
-    int code = http.GET();
-    int len = http.getSize();
+  const char *headerkeys[] = {"x-MD5", "x-SHA256", "x-SHA512"};
+  size_t headerkeyssize = sizeof(headerkeys) / sizeof(char *);
 
-    if(code <= 0) {
-        log_e("HTTP error: %s\n", http.errorToString(code).c_str());
-        _lastError = code;
-        http.end();
-        return HTTP_UPDATE_FAILED;
-    }
+  // track these headers
+  http.collectHeaders(headerkeys, headerkeyssize);
 
+  int code = http.GET();
+  int len = http.getSize();
 
-    log_d("Header read fin.\n");
-    log_d("Server header:\n");
-    log_d(" - code: %d\n", code);
-    log_d(" - len: %d\n", len);
+  if (code <= 0) {
+    log_e("HTTP error: %s\n", http.errorToString(code).c_str());
+    _lastError = code;
+    http.end();
+    return HTTP_UPDATE_FAILED;
+  }
 
-    if(http.hasHeader("x-MD5")) {
-        log_d(" - MD5: %s\n", http.header("x-MD5").c_str());
-    }
+  log_d("Header read fin.\n");
+  log_d("Server header:\n");
+  log_d(" - code: %d\n", code);
+  log_d(" - len: %d\n", len);
 
-    log_d("ESP32 info:\n");
-    log_d(" - free Space: %d\n", ESP.getFreeSketchSpace());
-    log_d(" - current Sketch Size: %d\n", ESP.getSketchSize());
+  // Precedence: setMD5sum()/setSHA256sum()/setSHA512sum() > response header > sidecar URL
+  if (_md5Sum.length()) {
+    md5 = _md5Sum;
+  } else if (http.hasHeader("x-MD5")) {
+    md5 = http.header("x-MD5");
+  } else if ((sidecarFailures & SIDECAR_MD5_FAILED) && code == HTTP_CODE_OK && len > 0) {
+    _lastError = HTTP_UE_SERVER_FAULTY_MD5;
+    http.end();
+    return HTTP_UPDATE_FAILED;
+  }
+  if (md5.length()) {
+    log_d(" - MD5: %s\n", md5.c_str());
+  }
 
-    if(currentVersion && currentVersion[0] != 0x00) {
-        log_d(" - current version: %s\n", currentVersion.c_str() );
-    }
+  if (_sha256Sum.length()) {
+    sha256 = _sha256Sum;
+  } else if (http.hasHeader("x-SHA256")) {
+    sha256 = http.header("x-SHA256");
+  } else if ((sidecarFailures & SIDECAR_SHA256_FAILED) && code == HTTP_CODE_OK && len > 0) {
+    _lastError = HTTP_UE_SERVER_FAULTY_SHA256;
+    http.end();
+    return HTTP_UPDATE_FAILED;
+  }
+  if (sha256.length()) {
+    log_d(" - SHA256: %s\n", sha256.c_str());
+  }
 
-    switch(code) {
+  if (_sha512Sum.length()) {
+    sha512 = _sha512Sum;
+  } else if (http.hasHeader("x-SHA512")) {
+    sha512 = http.header("x-SHA512");
+  } else if ((sidecarFailures & SIDECAR_SHA512_FAILED) && code == HTTP_CODE_OK && len > 0) {
+    _lastError = HTTP_UE_SERVER_FAULTY_SHA512;
+    http.end();
+    return HTTP_UPDATE_FAILED;
+  }
+  if (sha512.length()) {
+    log_d(" - SHA512: %s\n", sha512.c_str());
+  }
+
+  log_d("ESP32 info:\n");
+  log_d(" - free Space: %" PRIu32 "\n", ESP.getFreeSketchSpace());
+  log_d(" - current Sketch Size: %" PRIu32 "\n", ESP.getSketchSize());
+
+  if (currentVersion && currentVersion[0] != 0x00) {
+    log_d(" - current version: %s\n", currentVersion.c_str());
+  }
+
+  switch (code) {
     case HTTP_CODE_OK:  ///< OK (Start Update)
-        if(len > 0) {
-            bool startUpdate = true;
-            if(spiffs) {
-                const esp_partition_t* _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
-                if(!_partition){
-                    _lastError = HTTP_UE_NO_PARTITION;
-                    return HTTP_UPDATE_FAILED;
-                }
-
-                if(len > _partition->size) {
-                    log_e("spiffsSize to low (%d) needed: %d\n", _partition->size, len);
-                    startUpdate = false;
-                }
-            } else {
-                int sketchFreeSpace = ESP.getFreeSketchSpace();
-                if(!sketchFreeSpace){
-                    _lastError = HTTP_UE_NO_PARTITION;
-                    return HTTP_UPDATE_FAILED;
-                }
-
-                if(len > sketchFreeSpace) {
-                    log_e("FreeSketchSpace to low (%d) needed: %d\n", sketchFreeSpace, len);
-                    startUpdate = false;
-                }
+      if (len > 0) {
+        bool startUpdate = true;
+        if (type != U_FLASH) {
+          const esp_partition_t *_partition = NULL;
+          if (type == U_SPIFFS) {
+            _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+          } else if (type == U_FATFS) {
+            _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, NULL);
+          } else if (type == U_LITTLEFS) {
+            _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, NULL);
+          } else if (type == U_FLASHFS) {
+            _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+            if (!_partition) {
+              _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, NULL);
             }
+            if (!_partition) {
+              _partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, NULL);
+            }
+          }
 
-            if(!startUpdate) {
-                _lastError = HTTP_UE_TOO_LESS_SPACE;
-                ret = HTTP_UPDATE_FAILED;
-            } else {
+          if (!_partition) {
+            _lastError = HTTP_UE_NO_PARTITION;
+            return HTTP_UPDATE_FAILED;
+          }
 
-                WiFiClient * tcp = http.getStreamPtr();
+          if (len > _partition->size) {
+            log_e("spiffsSize to low (%" PRIu32 ") needed: %" PRIu32 "\n", _partition->size, len);
+            startUpdate = false;
+          }
+        } else {
+          int sketchFreeSpace = ESP.getFreeSketchSpace();
+          if (!sketchFreeSpace) {
+            _lastError = HTTP_UE_NO_PARTITION;
+            return HTTP_UPDATE_FAILED;
+          }
 
-// To do?                WiFiUDP::stopAll();
-// To do?                WiFiClient::stopAllExcept(tcp);
+          if (len > sketchFreeSpace) {
+            log_e("FreeSketchSpace to low (%d) needed: %d\n", sketchFreeSpace, len);
+            startUpdate = false;
+          }
+        }
 
-                delay(100);
+        if (!startUpdate) {
+          _lastError = HTTP_UE_TOO_LESS_SPACE;
+          ret = HTTP_UPDATE_FAILED;
+        } else {
+          // Warn main app we're starting up...
+          if (_cbStart) {
+            _cbStart();
+          }
 
-                int command;
+          NetworkClient *tcp = http.getStreamPtr();
 
-                if(spiffs) {
-                    command = U_SPIFFS;
-                    log_d("runUpdate spiffs...\n");
-                } else {
-                    command = U_FLASH;
-                    log_d("runUpdate flash...\n");
-                }
+          // To do?                NetworkUDP::stopAll();
+          // To do?                NetworkClient::stopAllExcept(tcp);
 
-                if(!spiffs) {
-/* To do
+          delay(100);
+
+          int command = type;
+
+          if (type == U_FLASH) {
+            log_d("runUpdate flash...\n");
+          } else {
+            log_d("runUpdate file system...\n");
+          }
+
+          if (type == U_FLASH) {
+            /* To do
                     uint8_t buf[4];
                     if(tcp->peekBytes(&buf[0], 4) != 4) {
                         log_e("peekBytes magic header failed\n");
@@ -299,16 +411,15 @@ HTTPUpdateResult HTTPUpdate::handleUpdate(HTTPClient& http, const String& curren
                     }
 */
 
-                    // check for valid first magic byte
-//                    if(buf[0] != 0xE9) {
-                    if(tcp->peek() != 0xE9) {
-                        log_e("Magic header does not start with 0xE9\n");
-                        _lastError = HTTP_UE_BIN_VERIFY_HEADER_FAILED;
-                        http.end();
-                        return HTTP_UPDATE_FAILED;
-
-                    }
-/* To do
+            // check for valid first magic byte
+            //                    if(buf[0] != 0xE9) {
+            if (tcp->peek() != 0xE9) {
+              log_e("Magic header does not start with 0xE9\n");
+              _lastError = HTTP_UE_BIN_VERIFY_HEADER_FAILED;
+              http.end();
+              return HTTP_UPDATE_FAILED;
+            }
+            /* To do
                     uint32_t bin_flash_size = ESP.magicFlashChipSize((buf[3] & 0xf0) >> 4);
 
                     // check if new bin fits to SPI flash
@@ -319,48 +430,53 @@ HTTPUpdateResult HTTPUpdate::handleUpdate(HTTPClient& http, const String& curren
                         return HTTP_UPDATE_FAILED;
                     }
 */
-                }
-                if(runUpdate(*tcp, len, http.header("x-MD5"), command)) {
-                    ret = HTTP_UPDATE_OK;
-                    log_d("Update ok\n");
-                    http.end();
-
-                    if(_rebootOnUpdate && !spiffs) {
-                        ESP.restart();
-                    }
-
-                } else {
-                    ret = HTTP_UPDATE_FAILED;
-                    log_e("Update failed\n");
-                }
+          }
+          if (runUpdate(*tcp, len, md5, command, sha256, sha512)) {
+            ret = HTTP_UPDATE_OK;
+            log_d("Update ok\n");
+            http.end();
+            // Warn main app we're all done
+            if (_cbEnd) {
+              _cbEnd();
             }
-        } else {
-            _lastError = HTTP_UE_SERVER_NOT_REPORT_SIZE;
-            ret = HTTP_UPDATE_FAILED;
-            log_e("Content-Length was 0 or wasn't set by Server?!\n");
-        }
-        break;
-    case HTTP_CODE_NOT_MODIFIED:
-        ///< Not Modified (No updates)
-        ret = HTTP_UPDATE_NO_UPDATES;
-        break;
-    case HTTP_CODE_NOT_FOUND:
-        _lastError = HTTP_UE_SERVER_FILE_NOT_FOUND;
-        ret = HTTP_UPDATE_FAILED;
-        break;
-    case HTTP_CODE_FORBIDDEN:
-        _lastError = HTTP_UE_SERVER_FORBIDDEN;
-        ret = HTTP_UPDATE_FAILED;
-        break;
-    default:
-        _lastError = HTTP_UE_SERVER_WRONG_HTTP_CODE;
-        ret = HTTP_UPDATE_FAILED;
-        log_e("HTTP Code is (%d)\n", code);
-        break;
-    }
 
-    http.end();
-    return ret;
+            if (_rebootOnUpdate && type == U_FLASH) {
+              ESP.restart();
+            }
+
+          } else {
+            ret = HTTP_UPDATE_FAILED;
+            log_e("Update failed\n");
+          }
+        }
+      } else {
+        _lastError = HTTP_UE_SERVER_NOT_REPORT_SIZE;
+        ret = HTTP_UPDATE_FAILED;
+        log_e("Content-Length was 0 or wasn't set by Server?!\n");
+      }
+      break;
+    case HTTP_CODE_NO_CONTENT:
+    case HTTP_CODE_NOT_MODIFIED:
+      ///< Not Modified (No updates)
+      ret = HTTP_UPDATE_NO_UPDATES;
+      break;
+    case HTTP_CODE_NOT_FOUND:
+      _lastError = HTTP_UE_SERVER_FILE_NOT_FOUND;
+      ret = HTTP_UPDATE_FAILED;
+      break;
+    case HTTP_CODE_FORBIDDEN:
+      _lastError = HTTP_UE_SERVER_FORBIDDEN;
+      ret = HTTP_UPDATE_FAILED;
+      break;
+    default:
+      _lastError = HTTP_UE_SERVER_WRONG_HTTP_CODE;
+      ret = HTTP_UPDATE_FAILED;
+      log_e("HTTP Code is (%d)\n", code);
+      break;
+  }
+
+  http.end();
+  return ret;
 }
 
 /**
@@ -368,48 +484,83 @@ HTTPUpdateResult HTTPUpdate::handleUpdate(HTTPClient& http, const String& curren
  * @param in Stream&
  * @param size uint32_t
  * @param md5 String
+ * @param command int
+ * @param sha256 String
+ * @param sha512 String
  * @return true if Update ok
  */
-bool HTTPUpdate::runUpdate(Stream& in, uint32_t size, String md5, int command)
-{
+bool HTTPUpdate::runUpdate(Stream &in, uint32_t size, String md5, int command, String sha256, String sha512) {
+  if (!_updater) {
+    return false;
+  }
 
-    StreamString error;
+  StreamString error;
 
-    if(!Update.begin(size, command, _ledPin, _ledOn)) {
-        _lastError = Update.getError();
-        Update.printError(error);
-        error.trim(); // remove line ending
-        log_e("Update.begin failed! (%s)\n", error.c_str());
-        return false;
+  if (_cbProgress) {
+    _updater->onProgress(_cbProgress);
+  }
+
+  if (!_updater->begin(size, command, _ledPin, _ledOn)) {
+    _lastError = _updater->getError();
+    _updater->printError(error);
+    error.trim();  // remove line ending
+    log_e("Update.begin failed! (%s)\n", error.c_str());
+    return false;
+  }
+
+  if (_cbProgress) {
+    _cbProgress(0, size);
+  }
+
+  if (md5.length()) {
+    if (!_updater->setMD5(md5.c_str())) {
+      _lastError = HTTP_UE_SERVER_FAULTY_MD5;
+      log_e("Update.setMD5 failed! (%s)\n", md5.c_str());
+      _updater->abort();
+      return false;
     }
+  }
 
-    if(md5.length()) {
-        if(!Update.setMD5(md5.c_str())) {
-            _lastError = HTTP_UE_SERVER_FAULTY_MD5;
-            log_e("Update.setMD5 failed! (%s)\n", md5.c_str());
-            return false;
-        }
+  if (sha256.length()) {
+    if (!_updater->setSHA256(sha256.c_str())) {
+      _lastError = HTTP_UE_SERVER_FAULTY_SHA256;
+      log_e("Update.setSHA256 failed! (%s)\n", sha256.c_str());
+      _updater->abort();
+      return false;
     }
+  }
 
-// To do: the SHA256 could be checked if the server sends it
-
-    if(Update.writeStream(in) != size) {
-        _lastError = Update.getError();
-        Update.printError(error);
-        error.trim(); // remove line ending
-        log_e("Update.writeStream failed! (%s)\n", error.c_str());
-        return false;
+  if (sha512.length()) {
+    if (!_updater->setSHA512(sha512.c_str())) {
+      _lastError = HTTP_UE_SERVER_FAULTY_SHA512;
+      log_e("Update.setSHA512 failed! (%s)\n", sha512.c_str());
+      _updater->abort();
+      return false;
     }
+  }
 
-    if(!Update.end()) {
-        _lastError = Update.getError();
-        Update.printError(error);
-        error.trim(); // remove line ending
-        log_e("Update.end failed! (%s)\n", error.c_str());
-        return false;
-    }
+  if (_updater->writeStream(in) != size) {
+    _lastError = _updater->getError();
+    _updater->printError(error);
+    error.trim();  // remove line ending
+    log_e("Update.writeStream failed! (%s)\n", error.c_str());
+    _updater->abort();
+    return false;
+  }
 
-    return true;
+  if (_cbProgress) {
+    _cbProgress(size, size);
+  }
+
+  if (!_updater->end()) {
+    _lastError = _updater->getError();
+    _updater->printError(error);
+    error.trim();  // remove line ending
+    log_e("Update.end failed! (%s)\n", error.c_str());
+    return false;
+  }
+
+  return true;
 }
 
 #if !defined(NO_GLOBAL_INSTANCES) && !defined(NO_GLOBAL_HTTPUPDATE)

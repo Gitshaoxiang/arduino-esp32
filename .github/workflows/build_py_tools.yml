@@ -1,0 +1,158 @@
+name: Build Python Tools
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/build_py_tools.yml"
+      - "tools/get.py"
+      - "tools/espota.py"
+      - "tools/flasher.py"
+      - "tools/gen_esp32part.py"
+      - "tools/gen_insights_package.py"
+      - "tools/bin_signing.py"
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  find-changed-tools:
+    name: Check if tools have been changed
+    runs-on: ubuntu-latest
+    outputs:
+      any_changed: ${{ steps.verify-changed-files.outputs.any_changed }}
+      all_changed_files: ${{ steps.verify-changed-files.outputs.all_changed_files }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Check if checkout failed
+        if: failure()
+        run: |
+          echo "Checkout failed."
+          echo "Make sure you are using a branch inside the repository and not a fork."
+
+      - name: Verify Python Tools Changed
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        id: verify-changed-files
+        with:
+          fetch_depth: "2"
+          since_last_remote_commit: "true"
+          files: |
+            tools/get.py
+            tools/espota.py
+            tools/flasher.py
+            tools/gen_esp32part.py
+            tools/gen_insights_package.py
+            tools/bin_signing.py
+
+      - name: List all changed files
+        shell: bash
+        run: |
+          for file in ${{ steps.verify-changed-files.outputs.all_changed_files }}; do
+            echo "$file was changed"
+          done
+
+  build-pytools-binaries:
+    name: Build python tools binaries for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: find-changed-tools
+    if: needs.find-changed-tools.outputs.any_changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: windows-latest
+            TARGET: win64
+            EXTEN: .exe
+            SEPARATOR: ";"
+          - os: macos-latest
+            TARGET: macos
+            SEPARATOR: ":"
+          - os: ubuntu-latest
+            TARGET: linux-amd64
+            SEPARATOR: ":"
+          - os: ubuntu-24.04-arm
+            TARGET: arm
+            SEPARATOR: ":"
+    env:
+      DISTPATH: pytools-${{ matrix.TARGET }}
+      PIP_EXTRA_INDEX_URL: "https://dl.espressif.com/pypi"
+    steps:
+      - name: List changed tools
+        shell: bash
+        run: |
+          CHANGED_FILES=()
+          for file in ${{ needs.find-changed-tools.outputs.all_changed_files }}; do
+              file="${file#*\/}"
+              file="${file%\.*}"
+              CHANGED_FILES+=("$file")
+          done
+          CHANGED_FILES="${CHANGED_FILES[@]}"
+          echo "CHANGED_TOOLS=$CHANGED_FILES" >> "$GITHUB_ENV"
+          for tool in ${{ env.CHANGED_TOOLS }}; do
+            echo "tool $tool was changed"
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.TOOLS_UPLOAD_PAT }}
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Set up Python 3
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.x
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller requests cryptography
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: |
+          for tool in ${{ env.CHANGED_TOOLS }}; do
+            pyinstaller --distpath ./${{ env.DISTPATH }} -F --icon=.github/pytools/espressif.ico tools/$tool.py
+          done
+
+      - name: Sign binaries
+        if: matrix.os == 'windows-latest'
+        uses: espressif/release-sign@d960931564d5b899bb6bd10dde1e9290c5c8a580 # master
+        with:
+          path: ./${{ env.DISTPATH }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-keyvault-uri: ${{ secrets.AZURE_KEYVAULT_URI }}
+          azure-keyvault-cert-name: ${{ secrets.AZURE_KEYVAULT_CERT_NAME }}
+
+      - name: Test binaries
+        shell: bash
+        run: |
+          for tool in ${{ env.CHANGED_TOOLS }}; do
+            ./${{ env.DISTPATH }}/$tool${{ matrix.EXTEN }} -h
+          done
+
+      - name: Push binary to tools
+        if: matrix.os == 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        shell: bash
+        run: |
+          for tool in ${{ env.CHANGED_TOOLS }}; do
+            cp -f ./${{ env.DISTPATH }}/$tool.exe tools/$tool.exe
+          done
+          bash .github/scripts/upload_py_tools.sh "${{ env.CHANGED_TOOLS }}"
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.DISTPATH }}
+          path: ${{ env.DISTPATH }}

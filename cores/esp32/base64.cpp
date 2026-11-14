@@ -35,21 +35,20 @@ extern "C" {
  * @param length size_t
  * @return String
  */
-String base64::encode(const uint8_t * data, size_t length)
-{
-    size_t size = base64_encode_expected_len(length) + 1;
-    char * buffer = (char *) malloc(size);
-    if(buffer) {
-        base64_encodestate _state;
-        base64_init_encodestate(&_state);
-        int len = base64_encode_block((const char *) &data[0], length, &buffer[0], &_state);
-        len = base64_encode_blockend((buffer + len), &_state);
+String base64::encode(const uint8_t *data, size_t length) {
+  size_t size = base64_encode_expected_len(length) + 1;
+  char *buffer = (char *)malloc(size);
+  if (buffer) {
+    base64_encodestate _state;
+    base64_init_encodestate(&_state);
+    int len = base64_encode_block((const char *)&data[0], length, &buffer[0], &_state);
+    len = base64_encode_blockend((buffer + len), &_state);
 
-        String base64 = String(buffer);
-        free(buffer);
-        return base64;
-    }
-    return String("-FAIL-");
+    String base64 = String(buffer);
+    free(buffer);
+    return base64;
+  }
+  return String("-FAIL-");
 }
 
 /**
@@ -57,8 +56,37 @@ String base64::encode(const uint8_t * data, size_t length)
  * @param text const String&
  * @return String
  */
-String base64::encode(const String& text)
-{
-    return base64::encode((uint8_t *) text.c_str(), text.length());
+String base64::encode(const String &text) {
+  return base64::encode((uint8_t *)text.c_str(), text.length());
 }
 
+/**
+ * convert base64 to input data
+ * @param data const char *
+ * @param length size_t
+ * @return String
+ */
+String base64::decode(const char *data, size_t length) {
+  size_t size = base64_decode_expected_len(length) + 1;
+  char *buffer = (char *)malloc(size);
+  if (buffer) {
+    int len = base64_decode_chars(data, (int)length, buffer);
+    if (len < 0) {
+      free(buffer);
+      return String("-FAIL-");
+    }
+    String decoded = String(buffer, (unsigned int)len);
+    free(buffer);
+    return decoded;
+  }
+  return String("-FAIL-");
+}
+
+/**
+ * convert base64 to input data
+ * @param text const String&
+ * @return String
+ */
+String base64::decode(const String &text) {
+  return base64::decode(text.c_str(), text.length());
+}

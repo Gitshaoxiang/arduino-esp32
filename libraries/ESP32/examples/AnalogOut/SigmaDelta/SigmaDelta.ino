@@ -1,18 +1,16 @@
-void setup()
-{
-    //setup channel 0 with frequency 312500 Hz
-    sigmaDeltaSetup(0, 312500);
-    //attach pin 18 to channel 0
-    sigmaDeltaAttachPin(18,0);
-    //initialize channel 0 to off
-    sigmaDeltaWrite(0, 0);
+#include <Arduino.h>
+
+void setup() {
+  //setup on pin 18 with frequency 312500 Hz
+  sigmaDeltaAttach(18, 312500);
+  //set pin 18 to off
+  sigmaDeltaWrite(18, 0);
 }
 
-void loop()
-{
-    //slowly ramp-up the value
-    //will overflow at 256
-    static uint8_t i = 0;
-    sigmaDeltaWrite(0, i++);
-    delay(100);
+void loop() {
+  //slowly ramp-up the value
+  //will overflow at 256
+  static uint8_t i = 0;
+  sigmaDeltaWrite(18, i++);
+  delay(100);
 }

@@ -13,10 +13,10 @@ WiFi	KEYWORD3
 #######################################
 
 WiFi	KEYWORD1
-WiFiClient	KEYWORD1
-WiFiServer	KEYWORD1
-WiFiUDP	KEYWORD1
-WiFiClientSecure	KEYWORD1
+NetworkClient	KEYWORD1
+NetworkServer	KEYWORD1
+NetworkUDP	KEYWORD1
+NetworkClientSecure	KEYWORD1
 
 #######################################
 # Methods and Functions (KEYWORD2)
@@ -59,6 +59,8 @@ softAPConfig	KEYWORD2
 printDiag	KEYWORD2
 hostByName	KEYWORD2
 scanNetworks	KEYWORD2
+setInactiveTime	KEYWORD2
+getInactiveTime	KEYWORD2
 
 #######################################
 # Constants (LITERAL1)
